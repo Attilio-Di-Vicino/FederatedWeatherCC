@@ -1,83 +1,167 @@
-# fl_client.py
+"""
+fl_client.py (Transformer)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+import flwr as fl
+import pandas as pd
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-import flwr as fl
-import logging
-import sys
-from train import load_config, load_data_client, build_model, train, evaluate, validate
+from torch.utils.data import DataLoader
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../utils")))
+from dataset import WeatherDataset
+
+from train import load_config, build_model, train_one_epoch, evaluate
+
+
+def _make_loaders(config: dict, station_id: int):
+    csv_path      = config["data"]["csv_path"]
+    input_window  = config["data"]["input_window"]
+    output_window = config["data"]["output_window"]
+    feature_cols  = config["data"]["feature_cols"]
+    target_cols   = config["data"]["target_cols"]
+    batch_size    = config["training"]["batch_size"]
+
+    df = pd.read_csv(csv_path, parse_dates=["datetime"])
+    df = df[df["station_id"] == station_id].sort_values("datetime").reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(f"No data for station_id={station_id}")
+
+    logger.info(f"[CLIENT {station_id}] {len(df)} rows")
+
+    n         = len(df)
+    train_end = int(0.70 * n)
+    val_end   = int(0.85 * n)
+
+    train_ds = WeatherDataset(df, input_window, output_window,
+                               feature_cols, target_cols, 0, train_end)
+    val_ds   = WeatherDataset(df, input_window, output_window,
+                               feature_cols, target_cols, train_end, val_end)
+    test_ds  = WeatherDataset(df, input_window, output_window,
+                               feature_cols, target_cols, val_end)
+
+    kwargs = dict(batch_size=batch_size, num_workers=0, pin_memory=False)
+    return (
+        DataLoader(train_ds, shuffle=True,  **kwargs),
+        DataLoader(val_ds,   shuffle=False, **kwargs),
+        DataLoader(test_ds,  shuffle=False, **kwargs),
+    )
+
+
 class FLClient(fl.client.NumPyClient):
-    def __init__(self, config,place_id):
-        self.config = config
-        self.device = torch.device(config["training"]["device"])
-        self.feature_cols = config["data"]["feature_cols"]
-        self.target_cols = config["data"]["target_cols"]
+    def __init__(self, config: dict, station_id: int):
+        self.config       = config
+        self.station_id   = station_id
+        self.device       = torch.device(
+            config["training"]["device"] if torch.cuda.is_available() else "cpu"
+        )
+        self.feature_cols  = config["data"]["feature_cols"]
+        self.target_cols   = config["data"]["target_cols"]
         self.output_window = config["data"]["output_window"]
-        self.input_dim = config["model"]["input_dim"]
-        self.output_dim = config["model"]["output_dim"]
+        self.feature_dim   = len(self.feature_cols)
+        self.local_epochs  = int(config["training"].get("local_epochs", 5))
+
         self.model = build_model(config, self.device)
-        self.train_loader, self.val_loader, self.test_loader = load_data_client(config,place_id)
+        self.train_loader, self.val_loader, self.test_loader = \
+            _make_loaders(config, station_id)
+
         self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=config["training"]["learning_rate"],weight_decay=1e-4)
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config["training"]["learning_rate"],
+            weight_decay=1e-4,
+        )
 
     def get_parameters(self, config=None):
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
-        state_dict = dict(zip(self.model.state_dict().keys(),[torch.tensor(p, device=self.device) for p in parameters]))
+        state_dict = dict(zip(
+            self.model.state_dict().keys(),
+            [torch.tensor(p, device=self.device) for p in parameters],
+        ))
         self.model.load_state_dict(state_dict)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        train(self.model, 
-              self.train_loader, 
-              self.criterion, 
-              self.optimizer, 
-              self.device, 
-              self.output_window, 
-              self.input_dim)
-        val_results = evaluate(self.model,
-                               self.test_loader,
-                               self.device,
-                               self.output_window,
-                               self.feature_cols,
-                               self.target_cols)
-        avg_val_mae = sum(r[1] for r in val_results) / len(val_results)
-        avg_val_mse = sum(r[2]**2 for r in val_results) / len(val_results)
-        metrics = {"val_mae": avg_val_mae, "val_mse": avg_val_mse}
-        torch.save(self.model.state_dict(), f"../../../data/trained_model/client_{place_id}_transformer.pth")
+
+        for epoch in range(self.local_epochs):
+            loss = train_one_epoch(
+                self.model, self.train_loader, self.criterion,
+                self.optimizer, self.device,
+                self.output_window, self.feature_dim,
+            )
+            logger.info(f"  [ws{self.station_id}] local epoch {epoch+1}/{self.local_epochs}"
+                         f"  loss={loss:.5f}")
+
+        val_results = evaluate(
+            self.model, self.val_loader, self.device,
+            self.output_window, self.feature_dim, self.target_cols,
+        )
+        metrics = {
+            "val_mae":   float(val_results[0]["mae"]),
+            "val_rmse":  float(val_results[0]["rmse"]),
+            "val_skill": float(val_results[0]["skill"]),
+        }
+        logger.info(f"[ws{self.station_id}] fit done — "
+                    f"val_mae={metrics['val_mae']:.4f}  "
+                    f"val_skill={metrics['val_skill']:.4f}")
+
+        os.makedirs("../../../data/trained_model", exist_ok=True)
+        torch.save(
+            self.model.state_dict(),
+            f"../../../data/trained_model/client_{self.station_id}_transformer.pth",
+        )
         return self.get_parameters(), len(self.train_loader.dataset), metrics
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         results = evaluate(
-        self.model,
-        self.test_loader,
-        self.device,
-        self.output_window,
-        self.feature_cols,
-        self.target_cols
+            self.model, self.test_loader, self.device,
+            self.output_window, self.feature_dim, self.target_cols,
         )
-        avg_mae = sum(r[1] for r in results) / len(results)
-        avg_mse = sum(r[2] for r in results) / len(results)
-        print("\n[Client Evaluation] TRANSFORMER")
-        print("="*30)
-        for name, mae , rmse, _ in results:
-            print(f"Target: {name:<10} | MEAN SQUARE ERROR: {rmse:.4f} | MEAN AVERAGE ERROR: {mae:.4f}")
-        return float(avg_mse), len(self.test_loader.dataset), {"mean average error": float(avg_mae), "mean square error": float(avg_mse)}
+        r = results[0]
+        print(f"\n[Client {self.station_id}] TRANSFORMER – TempOut")
+        print("=" * 55)
+        print(f"  MAE={r['mae']:.4f}  RMSE={r['rmse']:.4f}  Skill={r['skill']:.4f}")
+
+        return (
+            float(r["rmse"] ** 2),
+            len(self.test_loader.dataset),
+            {
+                "mae":   float(r["mae"]),
+                "rmse":  float(r["rmse"]),
+                "skill": float(r["skill"]),
+            },
+        )
+
 
 if __name__ == "__main__":
-    config = load_config("config.yaml")
-    logger.info("Starting Client...")
     if len(sys.argv) < 3:
-        print("Usage: python fl_client.py <place_id> <server_address>")
+        print("Usage: python fl_client.py <station_id> <server_address>")
         sys.exit(1)
-    place_id = int(sys.argv[1])
+
+    station_id     = int(sys.argv[1])
     server_address = sys.argv[2]
-    client = FLClient(config, place_id)
-    fl.client.start_client(server_address=server_address, client=client.to_client())
+
+    logger.info(f"Starting Transformer FL Client  "
+                f"station_id={station_id}  server={server_address}")
+
+    cfg    = load_config("config.yaml")
+    client = FLClient(cfg, station_id)
+    fl.client.start_client(
+        server_address=server_address,
+        client=client.to_client(),
+        transport="grpc-bidi",
+    )

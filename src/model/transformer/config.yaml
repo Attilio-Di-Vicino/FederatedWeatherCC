@@ -1,29 +1,40 @@
-# config.yaml
 data:
   csv_path: "../../../data/processed_data/dataset.csv"
+
   feature_cols:
     - station_id
-    - temperature
-    - humidity
-    - wind_speed
+    - Barometer
+    - HumOut
+    - RainDay
+    - WindSpeed
+    - WindSpeed10Min
     - wind_sin
     - wind_cos
+
   target_cols:
-    - temperature
-  input_window: 20 # hours
-  output_window: 2 # hours
+    - TempOut
+
+  input_window: 20
+  output_window: 2
 
 training:
   batch_size: 16
   learning_rate: 0.001
-  epochs: 25
-  device: "cpu"
+  epochs: 100
+  device: "cuda"
   rounds: 20
+  n_splits: 5           # folds for TimeSeriesSplit cross-validation
+
+  checkpoint_dir: "../../../data/trained_model/checkpoints/transformer"
+  checkpoint_every: 5
+
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.00001
 
 model:
-  input_dim: 6 
-  output_dim: 1           
-  d_model: 64             
+  input_dim: 8          # len(feature_cols)
+  output_dim: 1
+  d_model: 64
   nhead: 4
   num_layers: 2
   dropout: 0.1

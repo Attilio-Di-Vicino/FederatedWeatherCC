@@ -1,145 +1,321 @@
-import torch
-from torch.utils.data import DataLoader
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import yaml
+"""
+train.py (Crossformer)
+"""
+
+from __future__ import annotations
+
+import logging
+import math
 import os
 import sys
+import yaml
+
+import numpy as np
 import pandas as pd
-import logging as log
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-# === PATHS ===
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../utils')))
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../utils")))
 from logger import Logger
-from dataset import Dataset
+from dataset import WeatherDataset
 from model import Crossformer
 
-def load_config(path="config.yaml"):
-    with open(path, "r") as file:
-        return yaml.safe_load(file)
+log_std = logging.getLogger(__name__)
 
-def load_data(config):
-    csv_path = config['data']['csv_path']
-    input_window = config['data']['input_window']
-    output_window = config['data']['output_window']
-    feature_cols = config['data']['feature_cols']
-    target_cols = config['data']['target_cols']
-    batch_size = config['training']['batch_size']
-    full_dataset = Dataset(csv_path, input_window, output_window, feature_cols, target_cols)
-    total_len = len(full_dataset.data)
-    train_end = int(0.8 * total_len)     
-    val_end = int(0.9 * total_len)
-    train_dataset = Dataset(csv_path, input_window, output_window, feature_cols, target_cols, start_idx=0, end_idx=train_end)
-    val_dataset = Dataset(csv_path, input_window, output_window, feature_cols, target_cols, start_idx=train_end, end_idx=val_end)
-    test_dataset = Dataset(csv_path, input_window, output_window, feature_cols, target_cols, start_idx=val_end)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path, "r") as fh:
+        return yaml.safe_load(fh)
+
+
+def load_data(config: dict):
+    """
+    Build train/val/test loaders for centralised training.
+    Split is applied PER STATION so each sliding window contains only
+    consecutive hours from a single station. All stations are then
+    concatenated into a single loader.
+    """
+    csv_path      = config["data"]["csv_path"]
+    input_window  = config["data"]["input_window"]
+    output_window = config["data"]["output_window"]
+    feature_cols  = config["data"]["feature_cols"]
+    target_cols   = config["data"]["target_cols"]
+    batch_size    = config["training"]["batch_size"]
+    pin           = torch.cuda.is_available()
+
+    df = pd.read_csv(csv_path, parse_dates=["datetime"])
+    station_ids = sorted(df["station_id"].unique())
+
+    train_datasets, val_datasets, test_datasets = [], [], []
+
+    for sid in station_ids:
+        df_s = df[df["station_id"] == sid].sort_values("datetime").reset_index(drop=True)
+        n         = len(df_s)
+        train_end = int(0.80 * n)
+        val_end   = int(0.90 * n)
+
+        train_datasets.append(WeatherDataset(df_s, input_window, output_window,
+                                              feature_cols, target_cols, 0, train_end))
+        val_datasets.append(  WeatherDataset(df_s, input_window, output_window,
+                                              feature_cols, target_cols, train_end, val_end))
+        test_datasets.append( WeatherDataset(df_s, input_window, output_window,
+                                              feature_cols, target_cols, val_end))
+
+    from torch.utils.data import ConcatDataset
+    train_loader = DataLoader(ConcatDataset(train_datasets), batch_size=batch_size,
+                              shuffle=True,  num_workers=4, pin_memory=pin)
+    val_loader   = DataLoader(ConcatDataset(val_datasets),   batch_size=batch_size,
+                              shuffle=False, num_workers=4, pin_memory=pin)
+    test_loader  = DataLoader(ConcatDataset(test_datasets),  batch_size=batch_size,
+                              shuffle=False, num_workers=4, pin_memory=pin)
     return train_loader, val_loader, test_loader
 
-def load_data_client(config, place_id):
-    csv_path = config['data']['csv_path']
-    input_window = config['data']['input_window']
-    output_window = config['data']['output_window']
-    feature_cols = config['data']['feature_cols']
-    target_cols = config['data']['target_cols']
-    batch_size = config['training']['batch_size']
-    df = pd.read_csv(csv_path, parse_dates=['datetime'])
-    df_place = df[df['station_id'] == place_id].sort_values('datetime')
-    log.info(f"[CLIENT {place_id}] -> LOADED {len(df_place)} ROWS FOR STATION_ID={place_id}")
-    total_len = len(df_place)
-    train_end = int(0.7 * total_len)
-    val_end = int(0.85 * total_len)
-    train_dataset = Dataset(df_place, input_window, output_window, feature_cols, target_cols, start_idx=0, end_idx=train_end)
-    val_dataset = Dataset(df_place, input_window, output_window, feature_cols, target_cols, start_idx=train_end, end_idx=val_end)
-    test_dataset = Dataset(df_place, input_window, output_window, feature_cols, target_cols, start_idx=val_end)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader, test_loader
 
-def build_model(config, device):
-    feature_cols = config['data']['feature_cols']
-    target_cols = config['data']['target_cols']
-    model = Crossformer(input_dim=len(feature_cols),output_dim=len(target_cols)).to(device)
-    return model
+def load_data_client(config: dict, station_id: int):
+    csv_path      = config["data"]["csv_path"]
+    input_window  = config["data"]["input_window"]
+    output_window = config["data"]["output_window"]
+    feature_cols  = config["data"]["feature_cols"]
+    target_cols   = config["data"]["target_cols"]
+    batch_size    = config["training"]["batch_size"]
 
-def train(model, train_loader, criterion, optimizer, device):
+    df = pd.read_csv(csv_path, parse_dates=["datetime"])
+    df = df[df["station_id"] == station_id].sort_values("datetime").reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(f"No data for station_id={station_id}")
+
+    log_std.info(f"[CLIENT {station_id}] {len(df)} rows")
+
+    n         = len(df)
+    train_end = int(0.70 * n)
+    val_end   = int(0.85 * n)
+
+    train_ds = WeatherDataset(df, input_window, output_window,
+                               feature_cols, target_cols, 0, train_end)
+    val_ds   = WeatherDataset(df, input_window, output_window,
+                               feature_cols, target_cols, train_end, val_end)
+    test_ds  = WeatherDataset(df, input_window, output_window,
+                               feature_cols, target_cols, val_end)
+
+    kwargs = dict(batch_size=batch_size, num_workers=0, pin_memory=False)
+    return (
+        DataLoader(train_ds, shuffle=False, **kwargs),
+        DataLoader(val_ds,   shuffle=False, **kwargs),
+        DataLoader(test_ds,  shuffle=False, **kwargs),
+    )
+
+
+def build_model(config: dict, device: torch.device) -> Crossformer:
+    mc = config["model"]
+    return Crossformer(
+        input_dim=len(config["data"]["feature_cols"]),
+        output_dim=len(config["data"]["target_cols"]),
+        d_model=mc.get("d_model", 64),
+        block_size=mc.get("block_size", 4),
+        nhead=mc.get("nhead", 4),
+        num_layers=mc.get("num_layers", 2),
+        dropout=mc.get("dropout", 0.1),
+        output_window=config["data"]["output_window"],
+    ).to(device)
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, val_loss,
+                    checkpoint_dir, tag="crossformer"):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, f"{tag}_epoch{epoch:04d}.pth")
+    torch.save({
+        "epoch": epoch, "val_loss": val_loss,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler else None,
+    }, path)
+    return path
+
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=1e-5):
+        self.patience   = patience
+        self.min_delta  = float(min_delta)
+        self.best_loss  = float("inf")
+        self.counter    = 0
+        self.best_state = None
+
+    def step(self, val_loss, model):
+        val_loss = float(val_loss)
+        if math.isnan(val_loss) or math.isinf(val_loss):
+            return False
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss  = val_loss
+            self.counter    = 0
+            self.best_state = {k: v.cpu().clone()
+                               for k, v in model.state_dict().items()}
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
+
+    def restore_best(self, model):
+        if self.best_state is not None:
+            model.load_state_dict(self.best_state)
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
     model.train()
-    total_loss = 0
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-        pred = model(x)
-        loss = criterion(pred, y)
+    total, steps = 0.0, 0
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(train_loader)
+        if scaler:
+            with autocast(device_type=device.type):
+                loss = criterion(model(x), y)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss = criterion(model(x), y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+        v = loss.item()
+        if not (math.isnan(v) or math.isinf(v)):
+            total += v; steps += 1
+    return total / steps if steps else float("nan")
 
-def validate(model, val_loader, criterion, device):
-    model.eval()
-    val_loss = 0
-    with torch.no_grad():
-        for x, y in val_loader:
-            x, y = x.to(device), y.to(device)
-            pred = model(x)
-            loss = criterion(pred, y)
-            val_loss += loss.item()
-    return val_loss / len(val_loader)
 
-def evaluate(model, test_loader, device, target_cols):
+def validate_one_epoch(model, loader, criterion, device):
     model.eval()
-    all_preds, all_targets = [], []
+    total, steps = 0.0, 0
     with torch.no_grad():
-        for x, y in test_loader:
-            x, y = x.to(device), y.to(device)
-            pred = model(x)
-            all_preds.append(pred.cpu().numpy())
-            all_targets.append(y.cpu().numpy())
-    all_preds = np.concatenate(all_preds, axis=0)       # shape: [B, T, F]
-    all_targets = np.concatenate(all_targets, axis=0)   # shape: [B, T, F]
+        for x, y in loader:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            with autocast(device_type=device.type):
+                pred = model(x)
+            v = criterion(pred, y).item()
+            if not (math.isnan(v) or math.isinf(v)):
+                total += v; steps += 1
+    return total / steps if steps else float("nan")
+
+
+def _skill(y_true, y_pred):
+    mse_m = mean_squared_error(y_true, y_pred)
+    mse_b = mean_squared_error(y_true, np.zeros_like(y_true))
+    return 1.0 - mse_m / mse_b if mse_b != 0 else 1.0
+
+
+def evaluate(model, loader, device, target_cols):
+    model.eval()
+    preds, targets = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            with autocast(device_type=device.type):
+                pred = model(x)
+            preds.append(pred.cpu().float().numpy())
+            targets.append(y.cpu().float().numpy())
+
+    preds   = np.concatenate(preds,   axis=0)
+    targets = np.concatenate(targets, axis=0)
+
     results = []
-    for i, target_name in enumerate(target_cols):
-        preds_flat = all_preds[:, :, i].reshape(-1)     # flatten tutte le finestre
-        targets_flat = all_targets[:, :, i].reshape(-1)
-        mae = mean_absolute_error(targets_flat, preds_flat)
-        rmse = mean_squared_error(targets_flat, preds_flat) ** 0.5
-        r2score_val = r2_score(targets_flat, preds_flat)
-        results.append((target_name, mae, rmse, r2score_val))
+    for i, name in enumerate(target_cols):
+        p = preds[:, :, i].reshape(-1)
+        t = targets[:, :, i].reshape(-1)
+        results.append({
+            "target": name,
+            "mae":    mean_absolute_error(t, p),
+            "rmse":   mean_squared_error(t, p) ** 0.5,
+            "skill":  _skill(t, p),
+        })
     return results
+
 
 def main():
     config = load_config()
-    log = Logger()
-    lr = config['training']['learning_rate']
-    epochs = config['training']['epochs']
-    device = torch.device(config['training']['device'])
-    batch_size = config['training']['batch_size']
-    feature_cols = config['data']['feature_cols']
-    target_cols = config['data']['target_cols']
-    log.info("CROSSFORMER HYPER-PARAMETERS:")
-    log.info(f'Learning rate: {lr}')
-    log.info(f'Epochs: {epochs}')
-    log.info(f'Device: {device}')
-    log.info(f'Batch size: {batch_size}')
-    log.info(f'Feature cols: {feature_cols}')
-    log.info(f'Target cols: {target_cols}\n')
+    log    = Logger()
+
+    lr            = config["training"]["learning_rate"]
+    epochs        = config["training"]["epochs"]
+    device        = torch.device(
+        config["training"]["device"] if torch.cuda.is_available() else "cpu"
+    )
+    if config["training"]["device"] == "cuda" and not torch.cuda.is_available():
+        log.warning("CUDA not available — falling back to CPU.")
+
+    target_cols      = config["data"]["target_cols"]
+    checkpoint_dir   = config["training"].get(
+                           "checkpoint_dir",
+                           "../../../data/trained_model/checkpoints/crossformer")
+    checkpoint_every = int(config["training"].get("checkpoint_every", 5))
+    es_patience      = int(config["training"].get("early_stopping_patience", 10))
+    es_min_delta     = float(config["training"].get("early_stopping_min_delta", 1e-5))
+
+    log.info(f"CROSSFORMER – TempOut  |  device={device}")
+    log.info(f"  d_model={config['model']['d_model']}  "
+             f"nhead={config['model']['nhead']}  "
+             f"layers={config['model']['num_layers']}")
+    log.info(f"  batch={config['training']['batch_size']}  "
+             f"lr={lr}  epochs={epochs}")
+
     train_loader, val_loader, test_loader = load_data(config)
-    model = build_model(config, device)
+    model     = build_model(config, device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    for epoch in range(epochs):
-        train_loss = train(model, train_loader, criterion, optimizer, device)
-        val_loss = validate(model, val_loader, criterion, device)
-        log.info(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6
+    )
+    scaler     = GradScaler("cuda") if device.type == "cuda" else None
+    early_stop = EarlyStopping(patience=es_patience, min_delta=es_min_delta)
+    best_val   = float("inf")
+
+    for epoch in range(1, epochs + 1):
+        tr = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        va = validate_one_epoch(model, val_loader, criterion, device)
+
+        if not math.isnan(va):
+            scheduler.step(va)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        log.info(f"Epoch {epoch:>3}/{epochs}  "
+                 f"train={tr:.5f}  val={va:.5f}  lr={current_lr:.2e}")
+
+        if math.isnan(tr) or math.isnan(va):
+            log.warning("NaN loss — check dataset.")
+            continue
+
+        if epoch % checkpoint_every == 0:
+            save_checkpoint(model, optimizer, scheduler, epoch, va, checkpoint_dir)
+            log.info(f"  Checkpoint saved (epoch {epoch})")
+
+        if va < best_val:
+            best_val = va
+            save_checkpoint(model, optimizer, scheduler, epoch, va,
+                            checkpoint_dir, tag="crossformer_best")
+
+        if early_stop.step(va, model):
+            log.info(f"Early stopping at epoch {epoch} "
+                     f"(best val={early_stop.best_loss:.5f})")
+            break
+
+    early_stop.restore_best(model)
+    log.info(f"Best val loss: {early_stop.best_loss:.5f}")
+
     results = evaluate(model, test_loader, device, target_cols)
-    log.info("\nValutazione finale:")
-    for name, mae, rmse, r2 in results:
-        log.info(f"MAE ({name}): {mae:.4f}")
-        log.info(f"RMSE ({name}): {rmse:.4f}")
-        log.info(f"R2 SCORE ({name}): {r2:.4f}")
+    log.info("\n── Final Evaluation (test set) ───────────────────────────")
+    for r in results:
+        log.info(f"  {r['target']}: MAE={r['mae']:.4f}  "
+                 f"RMSE={r['rmse']:.4f}  Skill={r['skill']:.4f}")
+
+    os.makedirs("../../../data/trained_model", exist_ok=True)
+    torch.save(model.state_dict(),
+               "../../../data/trained_model/crossformer_tempout_final.pth")
+    log.info("Model saved.")
+
 
 if __name__ == "__main__":
     main()
