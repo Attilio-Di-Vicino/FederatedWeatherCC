@@ -70,7 +70,7 @@ class FLClient(fl.client.NumPyClient):
         self.target_cols   = config["data"]["target_cols"]
         self.output_window = config["data"]["output_window"]
         self.feature_dim   = len(self.feature_cols)
-        self.local_epochs  = int(config["training"].get("local_epochs", 5))
+        self.local_epochs  = int(config["training"].get("local_epochs", 2))
 
         self.model = build_model(config, self.device)
         self.train_loader, self.val_loader, self.test_loader = \

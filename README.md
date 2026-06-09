@@ -144,13 +144,19 @@ cd src/model/transformer   # or crossformer
 python fl_server.py
 
 # Terminals 2–9 — one client per station
-python fl_client.py 1 localhost:8081
-python fl_client.py 2 localhost:8081
+python fl_client.py 1 localhost:8082
+python fl_client.py 2 localhost:8082
+python fl_client.py 3 localhost:8082
+python fl_client.py 4 localhost:8082
+python fl_client.py 5 localhost:8082
+python fl_client.py 6 localhost:8082
+python fl_client.py 7 localhost:8082
+
 # ... through station 8
-python fl_client.py 8 localhost:8081
+python fl_client.py 8 localhost:8082
 ```
 
-Crossformer server listens on port **8082**; Transformer on **8081**.
+Crossformer server listens on port **8082**; Transformer on **8082**.
 
 ---
 
@@ -166,7 +172,7 @@ data:
     - TempOut
 
 training:
-  local_epochs: 5        # local training epochs per FL round
+  local_epochs: 2        # local training epochs per FL round
   rounds: 20             # federated communication rounds
 
 model:

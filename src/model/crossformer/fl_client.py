@@ -67,7 +67,7 @@ class FLClient(fl.client.NumPyClient):
             config["training"]["device"] if torch.cuda.is_available() else "cpu"
         )
         self.target_cols   = config["data"]["target_cols"]
-        self.local_epochs  = int(config["training"].get("local_epochs", 5))
+        self.local_epochs  = int(config["training"].get("local_epochs", 25))
 
         self.model = build_model(config, self.device)
         self.train_loader, self.val_loader, self.test_loader = \
