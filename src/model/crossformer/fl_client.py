@@ -1,5 +1,10 @@
 """
-fl_client.py  (Crossformer)
+fl_client.py  –  Crossformer Federated Learning Client  (TempOut)
+
+Key fixes vs previous:
+  - local_epochs: runs multiple training epochs per FL round (default 5)
+    so the global model actually learns before weights are aggregated
+  - num_workers=0, pin_memory=False to avoid gRPC/PyTorch conflict
 """
 
 from __future__ import annotations
@@ -67,7 +72,7 @@ class FLClient(fl.client.NumPyClient):
             config["training"]["device"] if torch.cuda.is_available() else "cpu"
         )
         self.target_cols   = config["data"]["target_cols"]
-        self.local_epochs  = int(config["training"].get("local_epochs", 25))
+        self.local_epochs  = int(config["training"].get("local_epochs", 5))
 
         self.model = build_model(config, self.device)
         self.train_loader, self.val_loader, self.test_loader = \
@@ -93,7 +98,7 @@ class FLClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
 
-        # Multiple local epochs per round: critical for FL convergence
+        # Multiple local epochs per round — critical for FL convergence
         for epoch in range(self.local_epochs):
             loss = train_one_epoch(
                 self.model, self.train_loader, self.criterion,
@@ -108,11 +113,10 @@ class FLClient(fl.client.NumPyClient):
         metrics = {
             "val_mae":   float(val_results[0]["mae"]),
             "val_rmse":  float(val_results[0]["rmse"]),
-            "val_skill": float(val_results[0]["skill"]),
         }
         logger.info(f"[ws{self.station_id}] fit done — "
                     f"val_mae={metrics['val_mae']:.4f}  "
-                    f"val_skill={metrics['val_skill']:.4f}")
+                    f"val_mae={metrics['val_mae']:.4f}")
 
         os.makedirs("../../../data/trained_model", exist_ok=True)
         torch.save(
@@ -129,7 +133,7 @@ class FLClient(fl.client.NumPyClient):
         r = results[0]
         print(f"\n[Client {self.station_id}] CROSSFORMER – TempOut")
         print("=" * 55)
-        print(f"  MAE={r['mae']:.4f}  RMSE={r['rmse']:.4f}  Skill={r['skill']:.4f}")
+        print(f"  MAE={r['mae']:.4f} ({r['mae_celsius']:.2f}°C)  RMSE={r['rmse']:.4f} ({r['rmse_celsius']:.2f}°C)")
 
         return (
             float(r["rmse"] ** 2),
@@ -137,7 +141,6 @@ class FLClient(fl.client.NumPyClient):
             {
                 "mae":   float(r["mae"]),
                 "rmse":  float(r["rmse"]),
-                "skill": float(r["skill"]),
             },
         )
 

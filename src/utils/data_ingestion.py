@@ -3,10 +3,12 @@ data_ingestion.py
 
 Supports two raw dataset directory structures simultaneously:
 
-  Structure A:  station/year/month/day/hourly_csv_files
-  Structure B:  station/month/date_csv_files  (all year 2025)
+  Structure A (old):  station/year/month/day/hourly_csv_files
+  Structure B (new):  station/month/date_csv_files  (all year 2025)
 
 Both are detected automatically per station directory.
+All other pipeline steps (wind encoding, hourly resampling,
+imputation, scaling) are unchanged from v6.
 
 Target  : TempOut
 Features: station_id, Barometer, HumOut, RainDay,
@@ -30,6 +32,7 @@ from sklearn.preprocessing import MinMaxScaler
 log = logging.getLogger(__name__)
 
 # ── Column definitions ────────────────────────────────────────────────────────
+
 RAW_KEEP_COLS = [
     "Barometer",
     "HumOut",
@@ -44,10 +47,10 @@ VALIDITY_RANGES: dict[str, tuple[float, float]] = {
     "Barometer":      (800.0,  1100.0),
     "HumOut":         (0.0,    100.0),
     "RainDay":        (0.0,    500.0),
-    "TempOut":        (-40.0,  60.0),
+    "TempOut":        (0.0,    45.0),    # Celsius — Naples coastal minimum is 0°C; sub-zero readings indicate sensor fault
     "WindDir":        (0.0,    360.0),
-    "WindSpeed":      (0.0,    100.0),
-    "WindSpeed10Min": (0.0,    100.0),
+    "WindSpeed":      (0.0,    30.0),    # m/s after mph→m/s conversion (~67mph max)
+    "WindSpeed10Min": (0.0,    30.0),
 }
 
 FEATURE_COLS = [
@@ -122,9 +125,22 @@ def _load_single_csv(filepath: Union[str, Path], station_id: int) -> pd.DataFram
         if col not in df.columns:
             df[col] = np.nan
 
-    # Coerce to numeric and clamp to valid ranges
+    # Coerce to numeric
     for col in RAW_KEEP_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Convert TempOut from °F to °C (sensors report in Fahrenheit)
+    # Confirmed from raw data: TempOut=48.7 in January → 48.7°F = 9.3°C
+    if "TempOut" in df.columns:
+        df["TempOut"] = (df["TempOut"] - 32.0) * 5.0 / 9.0
+
+    # Also convert WindSpeed fields if reported in mph → m/s
+    # Davis Vantage sensors report wind in mph; 1 mph = 0.44704 m/s
+    for wind_col in ("WindSpeed", "WindSpeed10Min"):
+        if wind_col in df.columns:
+            df[wind_col] = df[wind_col] * 0.44704
+
+    # Clamp to valid physical ranges (now in SI / metric units)
     for col, (lo, hi) in VALIDITY_RANGES.items():
         if col in df.columns:
             df.loc[(df[col] < lo) | (df[col] > hi), col] = np.nan

@@ -25,7 +25,7 @@ training:
   local_epochs: 5
   rounds: 50
 
-  #sproximal_mu: 0.1              # FedProx regularization strength
+  #proximal_mu: 0.1              # FedProx regularization strength
   early_stopping_patience: 10 
 
   checkpoint_dir: "../../../data/trained_model/checkpoints/crossformer"

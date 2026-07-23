@@ -1,7 +1,5 @@
 """
 fl_server.py  –  Crossformer FL Server  (TempOut)
-
-Pure FL — no warm start. Stronger proximal_mu to limit client drift.
 """
 from __future__ import annotations
 import logging
@@ -14,7 +12,8 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 config = load_config("config.yaml")
-rounds = config["training"]["rounds"]
+rounds      = config["training"]["rounds"]
+proximal_mu = float(config["training"].get("proximal_mu", 0.3))
 
 
 def weighted_average(metrics):
@@ -25,7 +24,10 @@ def weighted_average(metrics):
     return result
 
 
-logger.info(f"Crossformer FL Server — {rounds} rounds, waiting for 8 clients")
+logger.info(
+    f"Crossformer FL Server — {rounds} rounds  "
+    f"proximal_mu={proximal_mu}  waiting for 8 clients"
+)
 
 fl.server.start_server(
     server_address="0.0.0.0:8082",

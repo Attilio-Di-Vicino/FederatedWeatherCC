@@ -1,8 +1,5 @@
 """
 fl_server.py  –  Transformer FL Server  (TempOut)
-
-Pure FL — no warm start. Global model initialised from random weights.
-Stronger proximal_mu to control client drift on non-IID station data.
 """
 from __future__ import annotations
 import logging
@@ -15,7 +12,8 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 config = load_config("config.yaml")
-rounds = config["training"]["rounds"]
+rounds      = config["training"]["rounds"]
+proximal_mu = float(config["training"].get("proximal_mu", 0.3))
 
 
 def weighted_average(metrics):
@@ -26,7 +24,10 @@ def weighted_average(metrics):
     return result
 
 
-logger.info(f"Transformer FL Server — {rounds} rounds, waiting for 8 clients")
+logger.info(
+    f"Transformer FL Server — {rounds} rounds  "
+    f"proximal_mu={proximal_mu}  waiting for 8 clients"
+)
 
 fl.server.start_server(
     server_address="0.0.0.0:8081",
@@ -39,6 +40,6 @@ fl.server.start_server(
         min_available_clients=8,
         fit_metrics_aggregation_fn=weighted_average,
         evaluate_metrics_aggregation_fn=weighted_average,
-        proximal_mu=0.3,    # stronger: limits client drift on non-IID stations
+        proximal_mu=0.3,
     ),
 )
